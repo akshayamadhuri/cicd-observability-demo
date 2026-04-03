@@ -1,0 +1,133 @@
+name: CI Pipeline with OTel Tracing
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  OTEL_ENDPOINT: ${{ secrets.OTEL_EXPORTER_ENDPOINT }}
+  OTEL_AUTH: ${{ secrets.OTEL_AUTH_HEADER }}
+  SERVICE_NAME: "cicd-observability-demo"
+  OTEL_CLI_VERSION: "0.4.1"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ── Step 1: Install otel-cli ──────────────────────────────────
+      - name: Install otel-cli
+        run: |
+          curl -sL https://github.com/equinix-labs/otel-cli/releases/download/v${OTEL_CLI_VERSION}/otel-cli_${OTEL_CLI_VERSION}_linux_amd64.tar.gz \
+            | tar xz otel-cli
+          sudo mv otel-cli /usr/local/bin/otel-cli
+          otel-cli version
+
+      # ── Step 2: Create root span for the whole pipeline run ───────
+      - name: Create root pipeline trace
+        run: |
+          # Start root span and save traceparent to env
+          TRACEPARENT=$(otel-cli span \
+            --endpoint "${OTEL_ENDPOINT}/v1/traces" \
+            --otlp-headers "Authorization=${OTEL_AUTH}" \
+            --service "${SERVICE_NAME}" \
+            --name "pipeline-run" \
+            --attrs "github.run_id=${{ github.run_id }},github.sha=${{ github.sha }},github.actor=${{ github.actor }},github.ref=${{ github.ref }}" \
+            --print-tp 2>/dev/null || echo "")
+          echo "TRACEPARENT=${TRACEPARENT}" >> $GITHUB_ENV
+
+      # ── Step 3: Checkout ──────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Trace - checkout
+        run: |
+          otel-cli span \
+            --endpoint "${OTEL_ENDPOINT}/v1/traces" \
+            --otlp-headers "Authorization=${OTEL_AUTH}" \
+            --service "${SERVICE_NAME}" \
+            --name "step/checkout" \
+            --traceparent "${TRACEPARENT}" \
+            --attrs "step.name=checkout,github.run_id=${{ github.run_id }}"
+
+      # ── Step 4: Setup Python ──────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      # ── Step 5: Install dependencies (timed) ─────────────────────
+      - name: Install dependencies
+        run: |
+          START=$(date +%s%N)
+          pip install -r requirements.txt
+          END=$(date +%s%N)
+          DURATION=$(( (END - START) / 1000000 ))
+          
+          otel-cli span \
+            --endpoint "${OTEL_ENDPOINT}/v1/traces" \
+            --otlp-headers "Authorization=${OTEL_AUTH}" \
+            --service "${SERVICE_NAME}" \
+            --name "step/install-dependencies" \
+            --traceparent "${TRACEPARENT}" \
+            --attrs "step.name=install,duration_ms=${DURATION},github.run_id=${{ github.run_id }}"
+
+      # ── Step 6: Run tests (timed + capture pass/fail) ─────────────
+      - name: Run tests
+        run: |
+          START=$(date +%s%N)
+          set +e
+          pytest test_app.py -v --tb=short 2>&1 | tee test-output.txt
+          TEST_EXIT_CODE=$?
+          set -e
+          END=$(date +%s%N)
+          DURATION=$(( (END - START) / 1000000 ))
+          
+          TESTS_PASSED=$(grep -c "PASSED" test-output.txt || echo 0)
+          TESTS_FAILED=$(grep -c "FAILED" test-output.txt || echo 0)
+          
+          otel-cli span \
+            --endpoint "${OTEL_ENDPOINT}/v1/traces" \
+            --otlp-headers "Authorization=${OTEL_AUTH}" \
+            --service "${SERVICE_NAME}" \
+            --name "step/run-tests" \
+            --traceparent "${TRACEPARENT}" \
+            --attrs "step.name=test,duration_ms=${DURATION},tests.passed=${TESTS_PASSED},tests.failed=${TESTS_FAILED},exit_code=${TEST_EXIT_CODE},github.run_id=${{ github.run_id }}" \
+            --status-code $([ $TEST_EXIT_CODE -eq 0 ] && echo "OK" || echo "ERROR")
+          
+          exit $TEST_EXIT_CODE
+
+      # ── Step 7: Build artifact ────────────────────────────────────
+      - name: Build artifact
+        run: |
+          START=$(date +%s%N)
+          mkdir -p dist
+          cp app.py dist/
+          zip -r dist/app.zip dist/app.py
+          END=$(date +%s%N)
+          DURATION=$(( (END - START) / 1000000 ))
+          
+          otel-cli span \
+            --endpoint "${OTEL_ENDPOINT}/v1/traces" \
+            --otlp-headers "Authorization=${OTEL_AUTH}" \
+            --service "${SERVICE_NAME}" \
+            --name "step/build-artifact" \
+            --traceparent "${TRACEPARENT}" \
+            --attrs "step.name=build,duration_ms=${DURATION},github.run_id=${{ github.run_id }}"
+
+      # ── Step 8: Close root span ───────────────────────────────────
+      - name: Close pipeline trace
+        if: always()
+        run: |
+          STATUS=$([ "${{ job.status }}" == "success" ] && echo "OK" || echo "ERROR")
+          
+          otel-cli span \
+            --endpoint "${OTEL_ENDPOINT}/v1/traces" \
+            --otlp-headers "Authorization=${OTEL_AUTH}" \
+            --service "${SERVICE_NAME}" \
+            --name "pipeline-complete" \
+            --traceparent "${TRACEPARENT}" \
+            --attrs "pipeline.status=${{ job.status }},github.run_id=${{ github.run_id }}" \
+            --status-code "${STATUS}"
