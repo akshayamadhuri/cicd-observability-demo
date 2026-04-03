@@ -20,10 +20,11 @@ jobs:
       # ── Step 1: Install otel-cli ──────────────────────────────────
       - name: Install otel-cli
         run: |
-          curl -sL https://github.com/equinix-labs/otel-cli/releases/download/v${OTEL_CLI_VERSION}/otel-cli_${OTEL_CLI_VERSION}_linux_amd64.tar.gz \
-            | tar xz otel-cli
-          sudo mv otel-cli /usr/local/bin/otel-cli
-          otel-cli version
+          curl -sL https://github.com/equinix-labs/otel-cli/releases/latest/download/otel-cli_linux_amd64.tar.gz -o otel-cli.tar.gz
+          tar -xvf otel-cli.tar.gz
+          chmod +x otel-cli
+          sudo mv otel-cli /usr/local/bin/
+          otel-cli span --name "test-span"
 
       # ── Step 2: Create root span for the whole pipeline run ───────
       - name: Create root pipeline trace
