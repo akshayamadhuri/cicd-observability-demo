@@ -19,11 +19,15 @@ jobs:
       # ── Step 1: Install otel-cli ──────────────────────────────────
       - name: Install otel-cli
         run: |
-          curl -sL https://github.com/equinix-labs/otel-cli/releases/latest/download/otel-cli_linux_amd64.tar.gz -o otel-cli.tar.gz
-          tar -xvf otel-cli.tar.gz
+          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/equinix-labs/otel-cli/releases/latest \
+            | grep "browser_download_url.*linux_amd64.tar.gz" \
+            | cut -d '"' -f 4)
+          echo "Downloading from: $DOWNLOAD_URL"
+          curl -sL "$DOWNLOAD_URL" -o otel-cli.tar.gz
+          tar -xzf otel-cli.tar.gz
           chmod +x otel-cli
           sudo mv otel-cli /usr/local/bin/
-          otel-cli --help | head -5
+          which otel-cli
 
       # ── Step 2: Checkout code ─────────────────────────────────────
       - name: Checkout code
