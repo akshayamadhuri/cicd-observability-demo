@@ -89,14 +89,13 @@ jobs:
           TESTS_PASSED=$(grep -c "PASSED" test-output.txt || echo 0)
           TESTS_FAILED=$(grep -c "FAILED" test-output.txt || echo 0)
           
-          otel-cli span \
-            --endpoint "${OTEL_ENDPOINT}/v1/traces" \
-            --otlp-headers "Authorization=${OTEL_AUTH}" \
-            --service "${SERVICE_NAME}" \
-            --name "step/run-tests" \
-            --traceparent "${TRACEPARENT}" \
-            --attrs "step.name=test,duration_ms=${DURATION},tests.passed=${TESTS_PASSED},tests.failed=${TESTS_FAILED},exit_code=${TEST_EXIT_CODE},github.run_id=${{ github.run_id }}" \
-            --status-code $([ $TEST_EXIT_CODE -eq 0 ] && echo "OK" || echo "ERROR")
+          - name: Close pipeline trace
+            run: |
+              otel-cli span \
+              --name "pipeline-end" \
+              --endpoint ${{ secrets.OTLP_ENDPOINT }} \
+              --protocol http/protobuf \
+              --headers "Authorization=Basic ${{ secrets.OTLP_AUTH }}"
           
           exit $TEST_EXIT_CODE
 
