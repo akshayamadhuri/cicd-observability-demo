@@ -10,12 +10,11 @@ env:
   OTEL_ENDPOINT: ${{ secrets.OTEL_EXPORTER_ENDPOINT }}
   OTEL_AUTH: ${{ secrets.OTEL_AUTH_HEADER }}
   SERVICE_NAME: "cicd-observability-demo"
-  OTEL_CLI_VERSION: "0.4.1"
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    
+
     steps:
       # ── Step 1: Install otel-cli ──────────────────────────────────
       - name: Install otel-cli
@@ -24,25 +23,31 @@ jobs:
           tar -xvf otel-cli.tar.gz
           chmod +x otel-cli
           sudo mv otel-cli /usr/local/bin/
-          otel-cli span --name "test-span"
+          otel-cli --help | head -5
 
-      # ── Step 2: Create root span for the whole pipeline run ───────
+      # ── Step 2: Checkout code ─────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Step 3: Setup Python ──────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      # ── Step 4: Create root span + save TRACEPARENT ───────────────
       - name: Create root pipeline trace
         run: |
-          # Start root span and save traceparent to env
-          TRACEPARENT=$(otel-cli span \
+          eval $(otel-cli span \
             --endpoint "${OTEL_ENDPOINT}/v1/traces" \
             --otlp-headers "Authorization=${OTEL_AUTH}" \
             --service "${SERVICE_NAME}" \
             --name "pipeline-run" \
             --attrs "github.run_id=${{ github.run_id }},github.sha=${{ github.sha }},github.actor=${{ github.actor }},github.ref=${{ github.ref }}" \
-            --print-tp 2>/dev/null || echo "")
+            --tp-export)
           echo "TRACEPARENT=${TRACEPARENT}" >> $GITHUB_ENV
 
-      # ── Step 3: Checkout ──────────────────────────────────────────
-      - name: Checkout code
-        uses: actions/checkout@v4
-
+      # ── Step 5: Trace checkout ────────────────────────────────────
       - name: Trace - checkout
         run: |
           otel-cli span \
@@ -50,32 +55,24 @@ jobs:
             --otlp-headers "Authorization=${OTEL_AUTH}" \
             --service "${SERVICE_NAME}" \
             --name "step/checkout" \
-            --traceparent "${TRACEPARENT}" \
             --attrs "step.name=checkout,github.run_id=${{ github.run_id }}"
 
-      # ── Step 4: Setup Python ──────────────────────────────────────
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-
-      # ── Step 5: Install dependencies (timed) ─────────────────────
+      # ── Step 6: Install dependencies (timed) ─────────────────────
       - name: Install dependencies
         run: |
           START=$(date +%s%N)
           pip install -r requirements.txt
           END=$(date +%s%N)
           DURATION=$(( (END - START) / 1000000 ))
-          
+
           otel-cli span \
             --endpoint "${OTEL_ENDPOINT}/v1/traces" \
             --otlp-headers "Authorization=${OTEL_AUTH}" \
             --service "${SERVICE_NAME}" \
             --name "step/install-dependencies" \
-            --traceparent "${TRACEPARENT}" \
             --attrs "step.name=install,duration_ms=${DURATION},github.run_id=${{ github.run_id }}"
 
-      # ── Step 6: Run tests (timed + capture pass/fail) ─────────────
+      # ── Step 7: Run tests (timed + capture pass/fail) ─────────────
       - name: Run tests
         run: |
           START=$(date +%s%N)
@@ -85,21 +82,21 @@ jobs:
           set -e
           END=$(date +%s%N)
           DURATION=$(( (END - START) / 1000000 ))
-          
+
           TESTS_PASSED=$(grep -c "PASSED" test-output.txt || echo 0)
           TESTS_FAILED=$(grep -c "FAILED" test-output.txt || echo 0)
-          
-          - name: Close pipeline trace
-            run: |
-              otel-cli span \
-              --name "pipeline-end" \
-              --endpoint ${{ secrets.OTLP_ENDPOINT }} \
-              --protocol http/protobuf \
-              --headers "Authorization=Basic ${{ secrets.OTLP_AUTH }}"
-          
+
+          otel-cli span \
+            --endpoint "${OTEL_ENDPOINT}/v1/traces" \
+            --otlp-headers "Authorization=${OTEL_AUTH}" \
+            --service "${SERVICE_NAME}" \
+            --name "step/run-tests" \
+            --attrs "step.name=test,duration_ms=${DURATION},tests.passed=${TESTS_PASSED},tests.failed=${TESTS_FAILED},exit_code=${TEST_EXIT_CODE},github.run_id=${{ github.run_id }}" \
+            --status-code $([ $TEST_EXIT_CODE -eq 0 ] && echo "ok" || echo "error")
+
           exit $TEST_EXIT_CODE
 
-      # ── Step 7: Build artifact ────────────────────────────────────
+      # ── Step 8: Build artifact ────────────────────────────────────
       - name: Build artifact
         run: |
           START=$(date +%s%N)
@@ -108,26 +105,24 @@ jobs:
           zip -r dist/app.zip dist/app.py
           END=$(date +%s%N)
           DURATION=$(( (END - START) / 1000000 ))
-          
+
           otel-cli span \
             --endpoint "${OTEL_ENDPOINT}/v1/traces" \
             --otlp-headers "Authorization=${OTEL_AUTH}" \
             --service "${SERVICE_NAME}" \
             --name "step/build-artifact" \
-            --traceparent "${TRACEPARENT}" \
             --attrs "step.name=build,duration_ms=${DURATION},github.run_id=${{ github.run_id }}"
 
-      # ── Step 8: Close root span ───────────────────────────────────
+      # ── Step 9: Close root span (always runs) ─────────────────────
       - name: Close pipeline trace
         if: always()
         run: |
-          STATUS=$([ "${{ job.status }}" == "success" ] && echo "OK" || echo "ERROR")
-          
+          STATUS=$([ "${{ job.status }}" == "success" ] && echo "ok" || echo "error")
+
           otel-cli span \
             --endpoint "${OTEL_ENDPOINT}/v1/traces" \
             --otlp-headers "Authorization=${OTEL_AUTH}" \
             --service "${SERVICE_NAME}" \
             --name "pipeline-complete" \
-            --traceparent "${TRACEPARENT}" \
             --attrs "pipeline.status=${{ job.status }},github.run_id=${{ github.run_id }}" \
             --status-code "${STATUS}"
